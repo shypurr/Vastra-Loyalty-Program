@@ -62,20 +62,37 @@ export function stickerCodes(src) {
   return src.codes.map((c) => ({ ...c, items: c.is_parent ? c.items : 0 }))
 }
 
-/** Build the sheet and hand the browser the finished file. onProgress gets a
- *  0-100 percentage — a 2,000-code run takes ~10-20s, so the caller needs to
- *  show something. */
+// Why a scope exists: a 1,000-item batch prints every child sticker plus the
+// box stickers, and the resulting PDF is unusable (and sometimes fails to
+// build at all) when all the manufacturer wanted was the box codes to put on
+// cartons. Filtering happens at print time, not generation time, so child
+// codes still exist, a box scan still credits all of them, and a saved batch
+// can be reprinted at a different scope months later.
+const EMPTY_FOR_SCOPE = {
+  all: 'This batch has no codes to print.',
+  boxes:
+    'This batch has no box codes — it was generated without an items-per-box ' +
+    'value, so there is nothing to print at this scope.',
+  items: 'This batch has no item codes to print.',
+}
+
+/** Build the sheet and hand the browser the finished file. `scope` is one of
+ *  'all' | 'boxes' | 'items'. onProgress gets a 0-100 percentage — a 2,000-code
+ *  run takes ~10-20s, so the caller needs to show something. */
 export async function buildStickerPdf({
   productName,
   sku,
   codes,
   filename,
+  scope = 'all',
   onProgress,
 }) {
-  const children = codes.filter((c) => !c.items)
-  const parents = codes.filter((c) => c.items > 0)
+  // Applied at this split rather than in the caller, so `total` — and with it
+  // the progress percentage — stays correct for every scope for free.
+  const children = scope === 'boxes' ? [] : codes.filter((c) => !c.items)
+  const parents = scope === 'items' ? [] : codes.filter((c) => c.items > 0)
   const total = children.length + parents.length
-  if (!total) throw new Error('This batch has no codes to print.')
+  if (!total) throw new Error(EMPTY_FOR_SCOPE[scope] ?? EMPTY_FOR_SCOPE.all)
 
   const doc = new jsPDF({ unit: 'mm', format: 'a4' })
   doc.setProperties({ title: `Loyalty QR - ${productName}` })

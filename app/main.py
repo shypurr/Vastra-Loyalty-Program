@@ -2093,7 +2093,12 @@ def save_batch(batch_id: int, user: dict = Depends(current_manufacturer)):
 @app.get("/qr/batches")
 def list_batches(status: str | None = Query(None, pattern="^(pending|saved)$"),
                  user: dict = Depends(current_manufacturer)):
-    sql = """SELECT b.*, b.product_sku AS sku
+    # `boxes` lets the panel's print-scope selector know whether a saved batch
+    # has box codes at all: qr_batches stores neither items_per_box nor a count,
+    # so without it "Box codes only" would be offered on batches that have none.
+    sql = """SELECT b.*, b.product_sku AS sku,
+                    (SELECT COUNT(*) FROM qr_codes c
+                      WHERE c.batch_id = b.id AND c.is_parent = 1) AS boxes
              FROM qr_batches b
              WHERE b.manufacturer_id = ?"""
     args: list = [user["id"]]

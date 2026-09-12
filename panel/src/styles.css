@@ -1461,6 +1461,54 @@ th.actions-col { text-align: right; }
 
 .modal .btn-row { margin-top: 6px; }
 
+/* ── print-scope selector (Generate QR modal) ──
+   A radio row, so it has to undo the column layout and uppercase labelling
+   that .modal label applies to ordinary form fields, and stop .modal input
+   from rendering each radio like a text box. */
+.scope-group { display: flex; flex-direction: column; gap: 6px; }
+
+.scope-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--ink-soft);
+}
+
+.modal label.scope-opt {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.modal label.scope-opt input[type='radio'] {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  accent-color: var(--primary);
+}
+
+/* A scope with nothing to print stays visible but unselectable — seeing
+   "0 boxes" explains more than hiding the option would. */
+.modal label.scope-opt.disabled { opacity: 0.5; cursor: not-allowed; }
+
+.saved-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.modal .scope-select { font-size: 13px; padding: 6px 8px; }
+
 /* ── toast: fixed feedback visible regardless of scroll position ── */
 .toast {
   position: fixed;

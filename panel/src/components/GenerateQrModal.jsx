@@ -7,6 +7,22 @@ import { buildStickerPdf, stickerCodes } from '../utils/stickerPdf.js'
 // /qr/generate contract (product_external_id + snapshot + points_per_code):
 // the catalog is the manufacturer's CSV import, so there's no products-table
 // lookup. `products` comes from GET /catalog/products.
+
+// Print scope. "Box codes only" exists because a 1,000-item batch otherwise
+// prints every child sticker alongside the box stickers, producing a PDF that
+// is slow to build and unwieldy to handle when only the carton codes are
+// wanted. Filtering is applied at print time, so child codes still exist, a box
+// scan still credits all of them, and a batch can be reprinted at a different
+// scope later.
+const PRINT_SCOPES = [
+  { id: 'all', label: 'All codes', unit: 'stickers',
+    count: (b) => (b.quantity ?? 0) + (b.boxes ?? 0) },
+  { id: 'boxes', label: 'Box codes only', unit: 'boxes',
+    count: (b) => b.boxes ?? 0 },
+  { id: 'items', label: 'Item codes only', unit: 'items',
+    count: (b) => b.quantity ?? 0 },
+]
+
 export default function GenerateQrModal({ products, onClose }) {
   const [productExternalId, setProductExternalId] = useState(
     products[0]?.external_id ?? '',
@@ -24,6 +40,10 @@ export default function GenerateQrModal({ products, onClose }) {
   // 2,000 codes takes ~10-20s where the server PDF was a single tab-open.
   const [printing, setPrinting] = useState(null) // batch id being rendered
   const [progress, setProgress] = useState(0)
+  // Two scopes, because the two print surfaces are independent: the radio
+  // group belongs to the batch just generated, the select to the saved list.
+  const [scope, setScope] = useState('all')
+  const [savedScope, setSavedScope] = useState('all')
 
   // Close on Escape, matching the other panel modals.
   useEffect(() => {
@@ -55,6 +75,7 @@ export default function GenerateQrModal({ products, onClose }) {
       const res = await post('/qr/generate', payload)
       setBatch(res)
       setSaved(false)
+      setScope('all') // the new batch may have no boxes at all
     } catch (err) {
       setError(err.message)
     } finally {
@@ -78,7 +99,7 @@ export default function GenerateQrModal({ products, onClose }) {
   // freshly generated batch, which already carries its codes; a saved batch is
   // fetched first. Either way the code list (including each code's server-built
   // payload URL) comes from the API, and buildStickerPdf just lays it out.
-  const printBatch = async (batchId, data) => {
+  const printBatch = async (batchId, data, printScope = 'all') => {
     setError(null)
     setPrinting(batchId)
     setProgress(0)
@@ -88,7 +109,12 @@ export default function GenerateQrModal({ products, onClose }) {
         productName: src.product_name,
         sku: src.product_sku,
         codes: stickerCodes(src),
-        filename: `loyalty-qr-batch-${batchId}.pdf`,
+        // Scope in the name so printing boxes and items from the same batch
+        // gives two distinct files instead of "…(1).pdf".
+        filename: `loyalty-qr-batch-${batchId}${
+          printScope === 'all' ? '' : `-${printScope}`
+        }.pdf`,
+        scope: printScope,
         onProgress: setProgress,
       })
     } catch (err) {
@@ -102,6 +128,7 @@ export default function GenerateQrModal({ products, onClose }) {
     setBatch(null)
     setSaved(false)
     setError(null)
+    setScope('all')
   }
 
   const loadSaved = () => {
@@ -198,18 +225,42 @@ export default function GenerateQrModal({ products, onClose }) {
             {batch.boxes ? (
               <p style={{ margin: '4px 0', color: 'var(--leaf)' }}>
                 + {batch.boxes} box QR codes ({batch.items_per_box} items each)
-                — print includes them
               </p>
             ) : null}
             <p className="mono sub" style={{ margin: '4px 0' }}>
               batch #{batch.batch_id}
             </p>
+            <div className="scope-group">
+              <span className="scope-title">Print</span>
+              {PRINT_SCOPES.map((s) => {
+                const n = s.count(batch)
+                return (
+                  <label
+                    key={s.id}
+                    className={`scope-opt${n ? '' : ' disabled'}`}
+                  >
+                    <input
+                      type="radio"
+                      name="print-scope"
+                      value={s.id}
+                      checked={scope === s.id}
+                      disabled={!n}
+                      onChange={() => setScope(s.id)}
+                    />
+                    <span>{s.label}</span>
+                    <span className="sub">
+                      · {n} {s.unit}
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
             {error && <p className="error">{error}</p>}
             <div className="btn-row">
               <button
                 className="btn-primary"
                 disabled={printing !== null}
-                onClick={() => printBatch(batch.batch_id, batch)}
+                onClick={() => printBatch(batch.batch_id, batch, scope)}
               >
                 {printing === batch.batch_id
                   ? `Building PDF… ${progress}%`
@@ -231,9 +282,23 @@ export default function GenerateQrModal({ products, onClose }) {
 
         {showSaved && (
           <div className="panel-card" style={{ marginTop: 14 }}>
-            <strong style={{ fontFamily: "'Helvetica Neue', Helvetica, Arial, sans-serif" }}>
-              Saved batches
-            </strong>
+            <div className="saved-head">
+              <strong style={{ fontFamily: "'Helvetica Neue', Helvetica, Arial, sans-serif" }}>
+                Saved batches
+              </strong>
+              <select
+                className="scope-select"
+                value={savedScope}
+                onChange={(e) => setSavedScope(e.target.value)}
+                aria-label="Print scope for saved batches"
+              >
+                {PRINT_SCOPES.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+            </div>
             {savedBatches === null ? (
               <p className="hint" style={{ margin: '8px 0 0' }}>
                 Loading…
@@ -251,18 +316,26 @@ export default function GenerateQrModal({ products, onClose }) {
                         {b.product_name}
                         <span className="sub">
                           {' '}
-                          · {b.quantity} codes · {b.points_per_code} pts ·{' '}
+                          · {b.quantity} codes
+                          {b.boxes ? ` · ${b.boxes} boxes` : ''} ·{' '}
+                          {b.points_per_code} pts ·{' '}
                           {b.created_at?.slice(0, 10)} · #{b.id}
                         </span>
                       </td>
                       <td className="actions-col">
-                        <button
-                          className="btn-ghost small"
-                          disabled={printing !== null}
-                          onClick={() => printBatch(b.id)}
-                        >
-                          {printing === b.id ? `${progress}%` : 'Print'}
-                        </button>
+                        {savedScope === 'boxes' && !b.boxes ? (
+                          // Nothing to print at this scope — say so rather than
+                          // offering a button that can only fail.
+                          <span className="sub">no boxes</span>
+                        ) : (
+                          <button
+                            className="btn-ghost small"
+                            disabled={printing !== null}
+                            onClick={() => printBatch(b.id, null, savedScope)}
+                          >
+                            {printing === b.id ? `${progress}%` : 'Print'}
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}

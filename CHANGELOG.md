@@ -4,6 +4,27 @@ Notable changes to the Loyalty QR API. Dates are when the change went live on
 production. Schema changes are additive (`_MIGRATIONS`), applied by `migrate()`
 on startup — no reseed, existing data preserved.
 
+## Unreleased (print box codes only)
+
+### Added
+- **Print-scope selector on the Generate QR modal** — *All codes* / *Box codes
+  only* / *Item codes only*, defaulting to All, each showing its own count. A
+  batch of 1,000+ items previously printed every child sticker alongside the box
+  stickers, producing a PDF that was slow to build and unwieldy to handle when
+  only the carton codes were wanted. The filter is applied at **print time**, not
+  generation time, so child codes are still created, a box scan still credits
+  every one of them, and a saved batch can be reprinted at a different scope
+  later. The scope is applied inside `buildStickerPdf` at the point it already
+  splits children from parents, which keeps the progress percentage correct for
+  free, and it lands in the filename (`…-boxes.pdf`) so printing both scopes from
+  one batch gives two distinct files. The saved-batches list carries its own
+  scope select and hides the Print button on batches that have no box codes.
+- **`boxes` on `GET /qr/batches`** — a correlated `COUNT(*)` of each batch's
+  parent codes. `qr_batches` stores neither `items_per_box` nor a box count, so
+  without it the saved-batches list could not tell which batches have box codes
+  and would offer "Box codes only" on batches that have none. No schema change.
+  New suite: `tests/test_qr_batch_boxes.py`.
+
 ## 2026-08-11 (`status` flag for YourApp · panel toolbar, exports & blank states)
 
 ### Added
