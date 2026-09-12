@@ -263,6 +263,9 @@ _INDEXES = [
     ("retailers", "idx_retailers_manuf", "manufacturer_id"),
     ("distributors", "idx_distributors_manuf", "manufacturer_id"),
     ("product_points", "idx_product_points_manuf", "manufacturer_id"),
+    # Scratch codes are looked up on every typed legacy scan; non-unique by
+    # design (see _MIGRATIONS), so the manufacturer scoping happens in the query.
+    ("qr_codes", "idx_qr_codes_legacy_scratch", "legacy_scratch"),
 ]
 
 # All tables, dropped on reset (order irrelevant — FK checks are disabled).
@@ -541,6 +544,20 @@ _MIGRATIONS = [
     ("product_points", "sku", "VARCHAR(191)"),
     ("product_points", "attrs", "MEDIUMTEXT"),
     ("product_points", "source", "VARCHAR(20)"),
+    # Legacy QR import (codes printed by the manufacturer's previous platform,
+    # already in the market and unscannable otherwise). legacy_code is the
+    # identifier parsed out of the old sticker's payload URL -- unique, because
+    # it is the match key. legacy_scratch is that platform's typed fallback: a
+    # 6-digit number, deliberately NOT unique, because 10^6 codes collide across
+    # tenants far too easily (our own manual_code draws 6 of 32 symbols, ~1.07
+    # billion) -- it is matched scoped to the scanning retailer's manufacturer.
+    # Both binary-collated: the legacy token is case-sensitive base62, so
+    # ai_ci matching would conflate distinct codes.
+    ("qr_codes", "legacy_code", "VARCHAR(191){CS}"),
+    ("qr_codes", "legacy_scratch", "VARCHAR(32){CS}"),
+    # 'imported' marks a batch synthesised by the legacy import (no stickers of
+    # ours were ever printed for it); NULL means we generated it.
+    ("qr_batches", "source", "VARCHAR(16)"),
 ]
 
 
@@ -601,6 +618,12 @@ _CONSTRAINTS = [
     "ON qr_batches(manufacturer_id)",
     "CREATE INDEX IF NOT EXISTS idx_ledger_product_ext "
     "ON points_ledger(product_external_id)",
+    # The legacy match key must be unique, which is also what makes a re-sent
+    # import chunk idempotent. Partial on SQLite so the vastly more common
+    # generated codes (legacy_code IS NULL) are unaffected; MySQL needs no
+    # predicate because a UNIQUE index there already treats NULLs as distinct.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_qr_legacy_code "
+    "ON qr_codes(legacy_code) WHERE legacy_code IS NOT NULL",
 ]
 
 # MySQL equivalents of the guards above. Two differences drive this list:
@@ -626,6 +649,8 @@ _MYSQL_CONSTRAINTS = [
      "CREATE INDEX idx_qr_batches_manuf ON qr_batches(manufacturer_id)"),
     ("points_ledger", "idx_ledger_product_ext",
      "CREATE INDEX idx_ledger_product_ext ON points_ledger(product_external_id)"),
+    ("qr_codes", "uq_qr_legacy_code",
+     "ALTER TABLE qr_codes ADD UNIQUE INDEX uq_qr_legacy_code (legacy_code)"),
 ]
 
 

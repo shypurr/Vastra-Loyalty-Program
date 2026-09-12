@@ -4,7 +4,65 @@ Notable changes to the Loyalty QR API. Dates are when the change went live on
 production. Schema changes are additive (`_MIGRATIONS`), applied by `migrate()`
 on startup — no reseed, existing data preserved.
 
-## Unreleased (print box codes only)
+## Unreleased (existing-QR import · print box codes only)
+
+### Added
+- **Import QR codes printed by a previous platform** (`POST /qr/codes/import`).
+  The manufacturer is migrating off Genefied and their stickers are already in
+  the market on stock sitting in godowns and on shelves, so reprinting is not an
+  option — those codes have to keep working exactly as printed. Each CSV row
+  becomes a `qr_codes` row under a synthetic batch per product
+  (`qr_batches.source = 'imported'`), taking its frozen `points_per_code` from
+  that product's catalog entry. Our own `token`/`manual_code` are still
+  generated, so an imported code behaves like any other everywhere else. Panel:
+  **Import existing QR** in the Products tab's overflow, which chunks the file
+  500 rows at a time with a progress percentage — a legacy export can carry six
+  figures of codes. New suite: `tests/test_legacy_qr_import.py`.
+- **Legacy code matching** (`qr_codes.legacy_code`, `qr_codes.legacy_scratch`).
+  The old sticker encodes a link to *that* platform's host
+  (`http://gverify.me/?Brand-Qi7YhrsToYI0Dbew`), so a phone camera opens their
+  site and never reaches us: these codes are scannable only through an in-app
+  scanner passing the raw decoded string, or by typing the scratch code.
+  `_find_code` resolves a canonical key — the token after the last hyphen —
+  derived identically at import and at scan time, so the same sticker matches
+  whether the scanner returns the URL with a raw space, `%20` or `+`, or just
+  the token. Matching order is unchanged for our own codes: token, then
+  `manual_code` (uppercased, dashes stripped — which would destroy a
+  case-sensitive legacy token, hence the separate branches), then legacy.
+  The `code` field on `POST /scan`, `POST /yourapp/scan` and
+  `POST /yourapp/qr/lookup` now accepts 200 characters instead of 64: a payload
+  URL's length is driven by the brand name embedded in it, and at 64 a brand of
+  ordinary length failed validation before the code was ever looked up. This
+  matters most on `/yourapp/scan`, which is the ONLY route by which a legacy
+  code can be redeemed at all.
+  Scan reversal (`GET /scans/lookup`, `POST /scans/reverse`) resolves legacy
+  codes too — without it a wrongly-scanned legacy sticker could be credited but
+  never undone, because the manufacturer types what the retailer reads out and
+  never our generated `manual_code`.
+- **Two guards worth knowing about.** The brand prefix embedded in the payload
+  is constant across one export, so it is used as an import-time check: a row
+  carrying a different one is another brand's file and is refused rather than
+  imported, since it would credit the wrong manufacturer's retailers. And
+  `legacy_scratch` is deliberately **not** unique — 6 digits is a million
+  possibilities against the ~1.07 billion of our own `manual_code`, and
+  `manual_code` is `UNIQUE` *globally*, so two tenants importing their own
+  legacy history would collide; scratch codes are instead matched scoped to the
+  scanning retailer's manufacturer.
+
+### Fixed
+- **A scanned payload URL now resolves for our OWN codes too.** Our printed QR
+  encodes `{QR_BASE_URL}/{token}`, but `_find_code` only ever matched the bare
+  token, so an in-app scanner forwarding the whole decoded string got a `404
+  Invalid code`. That was pre-existing and latent; it becomes load-bearing with
+  the legacy import, because forwarding the raw scan is exactly how a legacy
+  code reaches us. Both formats now reduce to their final segment, so neither
+  side has to parse the other's URL shape.
+- **A typed code matching both a manual code and an imported scratch code is
+  refused (409) instead of silently picking one.** Our manual-code alphabet
+  excludes 0 and 1 but includes 2-9, so an all-digit manual code is possible and
+  can equal a 6-digit legacy scratch code within one manufacturer. Whichever won
+  would have redeemed a sticker still sitting on a shelf. Related: a typed code
+  belonging to another tenant no longer masks this retailer's own scratch code.
 
 ### Added
 - **Print-scope selector on the Generate QR modal** — *All codes* / *Box codes

@@ -16,6 +16,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
+from urllib.parse import unquote_plus
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -364,8 +365,11 @@ class GenerateIn(BaseModel):
 
 class ScanIn(BaseModel):
     code: str = Field(
-        min_length=1, max_length=64,
-        description="QR token or 6-char manual code (dashes/spaces ok)",
+        # 200, not 64: an imported legacy sticker's payload is a full URL
+        # (http://host/?Brand-TOKEN), which a scanner hands over verbatim.
+        min_length=1, max_length=200,
+        description="QR token, 6-char manual code (dashes/spaces ok), or an "
+                    "imported legacy code (payload URL, bare token or scratch)",
     )
     # Where this scan happened. Captured once per webview session on the
     # client and sent with every scan; null when location was denied.
@@ -796,6 +800,20 @@ _CSV_POINTS_HEADERS = ("points", "loyalty_points", "points_per_scan",
 # Row-number columns are a render index that re-numbers on every export; they
 # carry no meaning once imported. "" catches headers like "#".
 _CSV_IGNORED_HEADERS = ("", "sno", "s_no", "sr_no", "serial", "no")
+# Legacy QR export (codes printed by the manufacturer's previous platform).
+# The product code reuses _CSV_CODE_HEADERS; note that "unit code" normalises
+# to unit_code and so can never be mistaken for the product's "code" column.
+_CSV_QR_UNIT_HEADERS = ("unit_code", "unit_url", "unique_code", "qr_code",
+                        "qr_url", "qr_link", "url", "link", "qr")
+_CSV_QR_SCRATCH_HEADERS = ("scratch_code", "scratch", "pin_code", "pin")
+_CSV_QR_STATUS_HEADERS = ("qr_status", "status", "scan_status")
+_CSV_QR_CREATED_HEADERS = ("created_at", "created_on", "created", "generated_at",
+                           "generated_on", "date")
+# The previous platform writes 1 for a code that has not been scanned. Anything
+# else is treated as already redeemed -- deliberately the fail-closed
+# direction: importing a burned code as available would let it be claimed a
+# second time, which costs real points, whereas the reverse is visible at once.
+_LEGACY_UNSCANNED = ("", "1")
 # Source systems export the literal text "null" for empty cells — keep that
 # word out of the manufacturer's table.
 _CSV_NULLISH = {"null", "none", "n/a", "na", "-", "--"}
@@ -1943,6 +1961,177 @@ def import_distributors_csv(request: Request, body: ImportIn,
                         "region": region_col}}
 
 
+def _fresh_manual_code(db) -> str:
+    """A manual code not already taken. Checked with a targeted SELECT rather
+    than by loading every existing code into a set (what /qr/generate does):
+    a legacy import can run to six figures of rows."""
+    for _ in range(50):
+        m = new_manual_code()
+        if not db.execute("SELECT 1 FROM qr_codes WHERE manual_code = ?",
+                          (m,)).fetchone():
+            return m
+    raise HTTPException(500, "Could not allocate a unique manual code")
+
+
+def _legacy_created_at(cell: str) -> str | None:
+    """The previous platform's creation timestamp, kept as real history. Only
+    an obviously-dated value is trusted; anything else falls back to now."""
+    v = _clean_cell(cell)
+    if len(v) >= 10 and v[:4].isdigit() and v[4] in "-/":
+        return v[:19]
+    return None
+
+
+@app.post("/qr/codes/import")
+@limiter.limit(RL_IMPORT)
+def import_legacy_qr_csv(request: Request, body: ImportIn,
+                         user: dict = Depends(current_manufacturer)):
+    """Import QR codes printed by the manufacturer's previous platform.
+
+    Those stickers are already in the market and cannot be reprinted, so the
+    codes have to keep working exactly as printed. Each row becomes a qr_codes
+    row carrying the legacy match key, under a synthetic batch per product
+    (source = 'imported'). Our own token/manual_code are still generated, so an
+    imported code behaves like any other everywhere else -- including scan
+    reversal, which keys off points_ledger.token.
+
+    Rows are flat: every imported code is a single item (parent_token NULL).
+    The export carries no carton structure to reconstruct.
+
+    Safe to call in chunks and safe to re-send a chunk: a row whose legacy key
+    already exists is skipped, which is what makes a half-failed upload of a
+    hundred thousand codes recoverable by simply retrying."""
+    import csv as csvmod
+    import io
+    mid = user["id"]
+    reader = csvmod.DictReader(io.StringIO(body.csv))
+    fields = [f for f in (reader.fieldnames or []) if (f or "").strip()]
+    norm = {f: _norm_header(f) for f in fields}
+    unit_col = _pick_col(fields, norm, _CSV_QR_UNIT_HEADERS)
+    code_col = _pick_col(fields, norm, _CSV_CODE_HEADERS)
+    if not unit_col:
+        raise HTTPException(422, "CSV is missing the QR code column (one of: "
+                                 + ", ".join(_CSV_QR_UNIT_HEADERS) + ")")
+    if not code_col:
+        raise HTTPException(422, "CSV is missing a product code column (one "
+                                 "of: " + ", ".join(_CSV_CODE_HEADERS) + ")")
+    scratch_col = _pick_col(fields, norm, _CSV_QR_SCRATCH_HEADERS)
+    status_col = _pick_col(fields, norm, _CSV_QR_STATUS_HEADERS)
+    created_col = _pick_col(fields, norm, _CSV_QR_CREATED_HEADERS)
+
+    created = skipped = redeemed = 0
+    errors: list[str] = []
+    batches: dict[str, int] = {}
+    products: dict[str, dict] = {}
+    brand = ""              # established by the first row that carries one
+    seen: set[str] = set()  # keys already handled in THIS file
+
+    with get_db() as db:
+        for i, raw in enumerate(reader, start=2):  # row 1 is the header
+            prefix, key = _legacy_parts(_clean_cell(raw.get(unit_col)))
+            if not key:
+                errors.append(f"row {i}: missing or unreadable QR code")
+                continue
+            # Every row of one export shares a brand prefix. A row that does
+            # not is another brand's file pasted in, and importing it would
+            # credit the wrong manufacturer's retailers.
+            if prefix and not brand:
+                brand = prefix
+            elif prefix and prefix != brand:
+                errors.append(
+                    f"row {i}: brand prefix {prefix!r} does not match "
+                    f"{brand!r} from the rest of the file")
+                continue
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            if db.execute("SELECT 1 FROM qr_codes WHERE legacy_code = ?",
+                          (key,)).fetchone():
+                skipped += 1
+                continue
+
+            ext = _clean_cell(raw.get(code_col))
+            if not ext:
+                errors.append(f"row {i}: missing product code")
+                continue
+            if ext not in products:
+                prod = db.execute(
+                    """SELECT product_external_id, points, name, sku
+                       FROM product_points
+                       WHERE manufacturer_id = ? AND product_external_id = ?
+                         AND source = 'import'""",
+                    (mid, ext),
+                ).fetchone()
+                products[ext] = dict(prod) if prod else None
+            prod = products[ext]
+            if not prod:
+                # Not a silent skip: a legacy code with no catalog product has
+                # no point value, so it would be a sticker worth an unknowable
+                # amount. Import the product catalog first, then re-run.
+                errors.append(
+                    f"row {i}: unknown product code {ext!r} -- import the "
+                    "product catalog first")
+                continue
+
+            if ext not in batches:
+                found = db.execute(
+                    """SELECT id FROM qr_batches
+                       WHERE manufacturer_id = ? AND product_external_id = ?
+                         AND source = 'imported'""",
+                    (mid, ext),
+                ).fetchone()
+                if found:
+                    batches[ext] = found["id"]
+                else:
+                    cur = db.execute(
+                        """INSERT INTO qr_batches
+                           (manufacturer_id, product_external_id, product_name,
+                            product_sku, quantity, points_per_code, status,
+                            source)
+                           VALUES (?, ?, ?, ?, 0, ?, 'saved', 'imported')""",
+                        (mid, ext, prod["name"] or ext, prod["sku"] or ext,
+                         prod["points"]),
+                    )
+                    batches[ext] = cur.lastrowid
+
+            status = _clean_cell(raw.get(status_col)) if status_col else ""
+            is_used = status.lower() not in _LEGACY_UNSCANNED
+            made = (_legacy_created_at(raw.get(created_col))
+                    if created_col else None)
+            scratch = (_clean_cell(raw.get(scratch_col)) or None
+                       if scratch_col else None)
+            db.execute(
+                """INSERT INTO qr_codes
+                   (token, manual_code, batch_id, is_parent, parent_token,
+                    legacy_code, legacy_scratch, redeemed_at, created_at)
+                   VALUES (?, ?, ?, 0, NULL, ?, ?, ?,
+                           COALESCE(?, datetime('now')))""",
+                (new_token(), _fresh_manual_code(db), batches[ext], key,
+                 scratch, (made or "1970-01-01 00:00:00") if is_used else None,
+                 made),
+            )
+            created += 1
+            if is_used:
+                redeemed += 1
+
+        # Recounted rather than incremented, so a chunked import totals
+        # correctly no matter how many requests it arrived in.
+        for bid in batches.values():
+            db.execute(
+                """UPDATE qr_batches SET quantity =
+                   (SELECT COUNT(*) FROM qr_codes WHERE batch_id = ?)
+                   WHERE id = ?""", (bid, bid))
+
+    # Echo the resolved mapping so the panel can show which of the file's
+    # columns were actually read (a wrong guess is otherwise invisible).
+    return {"created": created, "skipped": skipped, "redeemed": redeemed,
+            "errors": errors, "brand": brand,
+            "columns": {"unit_code": unit_col, "product_code": code_col,
+                        "scratch": scratch_col, "status": status_col,
+                        "created_at": created_col}}
+
+
 # ---------- QR generation (manufacturer-scoped) ----------
 
 @app.post("/qr/generate", status_code=201)
@@ -2194,22 +2383,128 @@ def code_image(token: str):
 
 # ---------- scan & redeem (retailer side, authenticated) ----------
 
-def _find_code(db, raw_code: str):
-    """Look up a code (QR token or 6-char manual code, dashes/spaces ok) with
-    its batch fields. Returns the row or None."""
-    code = raw_code.strip().replace("-", "").replace(" ", "").upper()
-    return db.execute(
-        """SELECT c.token, c.redeemed_at, c.redeemed_by, c.is_parent,
+# ---------- legacy (imported) code matching ----------
+#
+# Codes printed by the manufacturer's previous platform encode a link to THAT
+# platform's host, e.g.
+#
+#     http://gverify.me/?Hirshita Leggings-Qi7YhrsToYI0Dbew
+#                        |---- brand ----||- 16-char token -|
+#
+# so they can only reach us through an in-app scanner (which hands over the raw
+# decoded string) or the typed scratch code. Three properties of that payload
+# drive the parsing below: the query string has no key (`?value`, so parse_qs is
+# useless), the embedded space comes back raw / %20 / + depending on the
+# scanner, and the prefix is the BRAND -- constant across a whole export, so it
+# identifies nothing. The token after the LAST hyphen is the entire identity.
+
+
+def _legacy_parts(raw: str) -> tuple[str, str]:
+    """(brand_prefix, token) from a legacy payload. Applied identically at
+    import time and at scan time, so a scanner returning the full URL and one
+    returning a bare token both canonicalise to the same key."""
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    s = s.split("?", 1)[1] if "?" in s else s.rsplit("/", 1)[-1]
+    s = unquote_plus(s)        # %20 and + both become a space
+    s = "".join(s.split())     # then drop whitespace entirely
+    brand, _, token = s.rpartition("-")
+    return brand, (token or s)
+
+
+def _legacy_key(raw: str) -> str:
+    """The canonical match key: the token half of _legacy_parts."""
+    return _legacy_parts(raw)[1]
+
+
+def _scratch_key(raw: str) -> str:
+    """The previous platform's typed fallback is a plain number. Only an
+    all-digit input can be one, so a URL or token never reaches this branch."""
+    s = (raw or "").strip()
+    return s if s.isdigit() and 4 <= len(s) <= 16 else ""
+
+
+_CODE_SELECT = """SELECT c.token, c.redeemed_at, c.redeemed_by, c.is_parent,
                   b.points_per_code,
                   b.product_id AS product_id,
                   b.product_external_id AS product_external_id,
                   b.product_name AS product_name, b.product_sku AS sku,
                   b.manufacturer_id
            FROM qr_codes c
-           JOIN qr_batches b ON b.id = c.batch_id
-           WHERE c.token = ? OR c.manual_code = ?""",
-        (raw_code.strip(), code),
-    ).fetchone()
+           JOIN qr_batches b ON b.id = c.batch_id"""
+
+
+def _find_code(db, raw_code: str, manufacturer_id: int | None = None):
+    """Look up a code with its batch fields. Returns the row, or None.
+
+    Four shapes reach this function, and after a migration all four are in the
+    market at once:
+
+      1. our QR token, as stored
+      2. a typed code -- our 6-char manual code, or an imported scratch code
+      3. a scanned payload URL, ours or the previous platform's
+      4. nothing that matches, which must stay indistinguishable from a code
+         belonging to another manufacturer (the enumeration-oracle rule)
+
+    `manufacturer_id` (the scanning retailer's) scopes the typed-code lookup.
+    The YourApp endpoints derive tenancy FROM the code and so pass None; there
+    an ambiguous scratch code resolves to nothing rather than guessing a tenant.
+    """
+    raw = raw_code.strip()
+    norm = raw.replace("-", "").replace(" ", "").upper()
+    scratch = _scratch_key(raw)
+
+    # 1. Our own token, byte-exact.
+    row = db.execute(_CODE_SELECT + " WHERE c.token = ?", (raw,)).fetchone()
+    if row:
+        return row
+
+    # 2. A typed code. Our manual codes draw from an alphabet that excludes 0
+    # and 1 but includes 2-9, so an all-digit manual code is possible and can
+    # collide with an imported scratch code. Both are resolved before either is
+    # returned: letting one silently win would redeem a sticker still sitting
+    # on a shelf.
+    manual = db.execute(
+        _CODE_SELECT + " WHERE c.manual_code = ?", (norm,)).fetchone()
+    if (manufacturer_id is not None and manual
+            and manual["manufacturer_id"] != manufacturer_id):
+        # Another tenant's code: _redeem_code would reject it anyway, and
+        # discarding it here lets this retailer's own scratch code be found.
+        manual = None
+    legacy_scratch = None
+    if scratch:
+        sql = _CODE_SELECT + " WHERE c.legacy_scratch = ?"
+        if manufacturer_id is not None:
+            legacy_scratch = db.execute(
+                sql + " AND b.manufacturer_id = ?",
+                (scratch, manufacturer_id)).fetchone()
+        else:
+            rows = db.execute(sql, (scratch,)).fetchall()
+            # Scratch codes are only 6 digits -- a million possibilities
+            # against the ~1.07 billion of our own manual codes -- so two
+            # tenants importing their own legacy history will genuinely share
+            # some. With no manufacturer to scope by, refuse to guess.
+            legacy_scratch = rows[0] if len(rows) == 1 else None
+    if manual and legacy_scratch and manual["token"] != legacy_scratch["token"]:
+        raise HTTPException(
+            409, "Ambiguous code: it matches two different stickers. Please "
+                 "scan the QR code instead of typing it.")
+    if manual:
+        return manual
+    if legacy_scratch:
+        return legacy_scratch
+
+    # 3. A scanned payload URL. Ours encodes {QR_BASE_URL}/{token}; the previous
+    # platform's encodes http://their-host/?Brand-TOKEN. _legacy_parts reduces
+    # both to their final segment, so an in-app scanner can forward whatever it
+    # decoded without either side parsing the other's format.
+    tail = _legacy_key(raw)
+    if tail and tail != norm:
+        return db.execute(
+            _CODE_SELECT + " WHERE c.token = ? OR c.legacy_code = ?",
+            (tail, tail)).fetchone()
+    return None
 
 
 def _best_scheme(db, manufacturer_id: int, product_id):
@@ -2350,8 +2645,9 @@ def scan(request: Request, body: ScanIn,
     """Redeem a code by QR token or 6-char manual code. Points always go to
     the logged-in retailer, so a code can't be credited to another account."""
     with get_db() as db:
-        return _redeem_code(db, retailer, _find_code(db, body.code),
-                            body.lat, body.lng)
+        # The retailer's manufacturer scopes the legacy scratch-code lookup.
+        row = _find_code(db, body.code, retailer["manufacturer_id"])
+        return _redeem_code(db, retailer, row, body.lat, body.lng)
 
 
 # ---------- YourApp server-to-server scan (phone-verified) ----------
@@ -2359,13 +2655,16 @@ def scan(request: Request, body: ScanIn,
 class YourAppScanIn(BaseModel):
     phone: str = Field(min_length=10, max_length=20,
                        description="Retailer's registered phone (as in YourApp)")
-    code: str = Field(min_length=1, max_length=64)
+    # 200, matching ScanIn: an imported legacy code's payload is a full URL and
+    # this endpoint is the only way such a code can ever be redeemed, so the
+    # cap has to clear the longest brand name a manufacturer might have.
+    code: str = Field(min_length=1, max_length=200)
     lat: float | None = Field(default=None, ge=-90, le=90)
     lng: float | None = Field(default=None, ge=-180, le=180)
 
 
 class YourAppLookupIn(BaseModel):
-    code: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1, max_length=200)  # see YourAppScanIn.code
 
 
 class YourAppPointsIn(BaseModel):
@@ -2673,15 +2972,36 @@ def _resolve_scan_group(db, manufacturer_id: int, code: str) -> dict:
     children are limited to those claimed by the box scanner, so items a
     different retailer scanned individually beforehand are untouched."""
     norm = code.strip().replace("-", "").replace(" ", "").upper()
-    row = db.execute(
-        """SELECT c.token, c.manual_code, c.is_parent, c.parent_token,
+    select = """SELECT c.token, c.manual_code, c.is_parent, c.parent_token,
                   c.redeemed_at, c.redeemed_by, b.points_per_code,
                   b.product_name, b.product_sku AS sku, b.manufacturer_id
            FROM qr_codes c
-           JOIN qr_batches b ON b.id = c.batch_id
-           WHERE c.token = ? OR c.manual_code = ?""",
+           JOIN qr_batches b ON b.id = c.batch_id"""
+    row = db.execute(
+        select + " WHERE c.token = ? OR c.manual_code = ?",
         (code.strip(), norm),
     ).fetchone()
+    # Imported (legacy) codes resolve here too, by the same priority order
+    # _find_code uses. Without this a wrongly-scanned legacy sticker could be
+    # credited but never reversed: the manufacturer types whatever the retailer
+    # reads out -- the payload URL or the scratch code -- and never our own
+    # manual_code, which is generated at import and printed nowhere.
+    if not row:
+        key = _legacy_key(code)
+        if key:
+            row = db.execute(
+                select + " WHERE c.legacy_code = ?", (key,)).fetchone()
+    if not row:
+        scratch = _scratch_key(code)
+        if scratch:
+            # Scoped in SQL, not by the ownership check below: scratch codes
+            # collide across tenants, and matching another manufacturer's row
+            # first would 404 a code this manufacturer really does own.
+            row = db.execute(
+                select + " WHERE c.legacy_scratch = ?"
+                " AND b.manufacturer_id = ?",
+                (scratch, manufacturer_id),
+            ).fetchone()
     # Same enumeration-proof 404 as /scan: an unknown code and another
     # manufacturer's code are indistinguishable from the response.
     if not row or row["manufacturer_id"] != manufacturer_id:

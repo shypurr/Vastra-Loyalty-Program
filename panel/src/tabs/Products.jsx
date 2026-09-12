@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { del, get, post, put } from '../api.js'
 import GenerateQrModal from '../components/GenerateQrModal.jsx'
-import ImportResult from '../components/ImportResult.jsx'
+import ImportResult, { ColumnMap } from '../components/ImportResult.jsx'
 import EmptyState from '../components/EmptyState.jsx'
 import SearchBox from '../components/SearchBox.jsx'
 import { useConfirm } from '../confirm.jsx'
 import { downloadSample } from '../utils/sampleCsv.js'
-import { downloadCSV, today } from '../utils/csv.js'
+import { downloadCSV, today, chunkCsv } from '../utils/csv.js'
 import { ToolbarButton, OverflowMenu } from '../components/Toolbar.jsx'
 import {
   IconImport, IconExport, IconSample, IconTrash, IconQr,
@@ -35,6 +35,11 @@ export default function Products() {
   const [page, setPage] = useState(0)
   const [query, setQuery] = useState('')
   const fileRef = useRef(null)
+  // Second file input: existing QR codes printed by a previous platform. Kept
+  // separate from the catalog import so neither can be fed the other's file.
+  const legacyRef = useRef(null)
+  const [legacy, setLegacy] = useState(null)     // aggregated import result
+  const [legacyPct, setLegacyPct] = useState(null) // null = not running
   const confirm = useConfirm()
 
   const products = catalog?.products ?? []
@@ -98,6 +103,55 @@ export default function Products() {
     // whether the file updates it or replaces it wholesale.
     if (imported) setPendingCsv({ csv, name: file.name })
     else runImport(csv, 'upsert')
+  }
+
+  // Chunked on purpose: a legacy export can run to six figures of codes, which
+  // is far past what one request should carry. Each chunk is independently
+  // idempotent server-side, so a failure part-way can simply be re-run.
+  const onImportLegacyFile = async (e) => {
+    const file = e.target.files?.[0]
+    if (file) e.target.value = ''
+    if (!file) return
+    setError(null)
+    setLegacy(null)
+    let text
+    try {
+      text = await file.text()
+    } catch (err) {
+      setError(`Could not read ${file.name}: ${err.message}`)
+      return
+    }
+    const chunks = chunkCsv(text, 500)
+    if (!chunks.length) {
+      setError(`${file.name} has no rows.`)
+      return
+    }
+    const total = { created: 0, skipped: 0, redeemed: 0, errors: [],
+                    columns: null, brand: '' }
+    setLegacyPct(0)
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const res = await post('/qr/codes/import', { csv: chunks[i] })
+        total.created += res.created ?? 0
+        total.skipped += res.skipped ?? 0
+        total.redeemed += res.redeemed ?? 0
+        total.errors.push(...(res.errors ?? []))
+        total.columns = total.columns ?? res.columns
+        total.brand = total.brand || res.brand
+        setLegacyPct(Math.round(((i + 1) / chunks.length) * 100))
+      }
+      setLegacy(total)
+    } catch (err) {
+      // Report what did land: the codes already imported are committed, and
+      // re-running the same file skips them rather than duplicating.
+      setError(
+        `${err.message} — ${total.created} code(s) imported before the ` +
+        'failure. Re-running the same file is safe: it will skip those.',
+      )
+      if (total.created || total.skipped) setLegacy(total)
+    } finally {
+      setLegacyPct(null)
+    }
   }
 
   const confirmReplace = async () => {
@@ -212,6 +266,13 @@ export default function Products() {
             style={{ display: 'none' }}
             onChange={onImportFile}
           />
+          <input
+            ref={legacyRef}
+            type="file"
+            accept=".csv,text/csv"
+            style={{ display: 'none' }}
+            onChange={onImportLegacyFile}
+          />
           {products.length > 0 && (
             <ToolbarButton icon={<IconQr />} onClick={() => setShowGenerate(true)}>
               Generate QR
@@ -238,6 +299,28 @@ export default function Products() {
                 icon: <IconSample />,
                 title: 'Download a filled-in example file with the expected columns',
                 onClick: () => downloadSample('products'),
+              },
+              {
+                label:
+                  legacyPct === null
+                    ? 'Import existing QR'
+                    : `Importing… ${legacyPct}%`,
+                icon: <IconQr />,
+                title:
+                  'Load QR codes already printed by your previous platform, ' +
+                  'so stickers already in the market keep working',
+                // Needs a real imported catalog: each code takes its points
+                // from its product, and sample products are not rows.
+                show: imported && products.length > 0,
+                disabled: busy || legacyPct !== null,
+                onClick: () => legacyRef.current?.click(),
+              },
+              {
+                label: 'Sample existing-QR CSV',
+                icon: <IconSample />,
+                title: 'Example of the code list exported by a previous platform',
+                show: imported && products.length > 0,
+                onClick: () => downloadSample('legacyQr'),
               },
               {
                 label: 'Delete all',
@@ -267,6 +350,46 @@ export default function Products() {
       )}
 
       {error && <p className="error">{error}</p>}
+      {legacy && (
+        <div className="panel-card" style={{ marginBottom: 14 }}>
+          <div className="schemes-head" style={{ marginBottom: 6 }}>
+            <strong>
+              Existing QR codes — imported {legacy.created} · skipped{' '}
+              {legacy.skipped}
+              {legacy.errors?.length
+                ? ` · ${legacy.errors.length} error(s)`
+                : ''}
+            </strong>
+            <button className="btn-ghost small" onClick={() => setLegacy(null)}>
+              Dismiss
+            </button>
+          </div>
+          <p className="hint" style={{ marginTop: 0 }}>
+            {legacy.brand ? (
+              <>
+                Brand <strong>{legacy.brand}</strong>.{' '}
+              </>
+            ) : null}
+            {/* Skipped is the expected result of re-running a file, not a
+                fault — say so, or it reads as data loss. */}
+            Skipped codes were already imported; re-running the same file is
+            safe.
+            {legacy.redeemed
+              ? ` ${legacy.redeemed} code(s) were already scanned on the old
+                 platform and were imported as used.`
+              : ''}
+          </p>
+          <ColumnMap columns={legacy.columns} />
+          {legacy.errors?.length > 0 && (
+            <ul className="hint" style={{ marginTop: 0 }}>
+              {legacy.errors.slice(0, 8).map((er, i) => (
+                <li key={i}>{er}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       <ImportResult
         result={importResult}
         onDismiss={() => setImportResult(null)}

@@ -38,6 +38,22 @@ const SAMPLES = {
       ['Cotton Kurti', 'CK-2044', '20', 'Kurti', 'Cotton'],
     ],
   },
+  // Codes printed by a previous loyalty platform. Headers mirror that
+  // platform's own export, which is what a manufacturer actually has to hand;
+  // the server matches them via _CSV_QR_*_HEADERS.
+  legacyQr: {
+    filename: 'sample-existing-qr.csv',
+    columns: [
+      'ID', 'batch running code', 'unit code', 'scratch code', 'product code',
+      'MRP', 'created at', 'QR status',
+    ],
+    rows: [
+      ['100001', 'BR-1', 'http://gverify.me/?Your Brand-Qi7YhrsToYI0Dbew',
+       '123451', 'BSS-1001', '0.00', '2025-04-11 10:22:31', '1'],
+      ['100002', 'BR-1', 'http://gverify.me/?Your Brand-Zk2MnpQrStUv3Wxy',
+       '123452', 'CK-2044', '0.00', '2025-04-11 10:22:31', '1'],
+    ],
+  },
   gifts: {
     filename: 'sample-rewards.csv',
     columns: ['Name', 'Points', 'Description', 'Image'],

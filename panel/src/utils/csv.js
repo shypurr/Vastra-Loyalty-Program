@@ -43,3 +43,37 @@ export function downloadCSV(filename, columns, rows) {
   a.remove()
   URL.revokeObjectURL(url)
 }
+
+/** Split CSV text into a list of smaller CSV documents, each repeating the
+ *  header row. Used by the existing-QR import, where a single file can carry
+ *  six figures of codes — far past what one request should hold.
+ *
+ *  Newlines inside a quoted cell are NOT row separators, so the scan tracks
+ *  quote state rather than splitting on \n. Getting that wrong would cut a
+ *  row in half and silently corrupt two records instead of importing one.
+ */
+export function chunkCsv(text, rowsPerChunk) {
+  const lines = []
+  let cur = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '"') quoted = !quoted
+    if ((ch === '\n' || ch === '\r') && !quoted) {
+      if (ch === '\r' && text[i + 1] === '\n') i++
+      lines.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  if (cur.trim()) lines.push(cur)
+  const header = lines.shift()
+  if (header === undefined) return []
+  const rows = lines.filter((l) => l.trim())
+  const out = []
+  for (let i = 0; i < rows.length; i += rowsPerChunk) {
+    out.push([header, ...rows.slice(i, i + rowsPerChunk)].join('\n'))
+  }
+  return out
+}
